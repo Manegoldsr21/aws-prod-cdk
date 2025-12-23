@@ -19,15 +19,13 @@ import java.util.List;
 import java.util.Map;
 
 public class ConductorStack extends Stack {
-    
     public static String ecsClusterName = "ConductorCluster";
     public static String ecsServiceName = "ConductorService";
     public static String rdsInstanceName = "ConductorDb";
-
     public ConductorStack(final Construct scope, final String id, final StackProps props) {
         super(scope, id, props);
 
-        // --- 1. NETWORK: Public Subnets only (Cost-effective) ---
+        // --- 1. NETWORK: Public Subnets (No NAT Gateways to save cost) ---
         Vpc vpc = Vpc.Builder.create(this, "ConductorVpc")
                 .maxAzs(2)
                 .natGateways(0)
@@ -63,7 +61,7 @@ public class ConductorStack extends Stack {
                 .build();
 
         // --- 3. SEARCH: OpenSearch (Single Node) ---
-        String myPublicIp = "65.31.164.160";
+        String myPublicIp = "65.31.164.160"; 
 
         Domain search = Domain.Builder.create(this, "ConductorSearch")
                 .version(EngineVersion.OPENSEARCH_2_11)
@@ -76,7 +74,7 @@ public class ConductorStack extends Stack {
                 .removalPolicy(RemovalPolicy.DESTROY)
                 .build();
 
-        // Access Policy for your IP (Dashboard)
+        // Allow your local IP to access the Dashboard
         search.addAccessPolicies(PolicyStatement.Builder.create()
                 .effect(Effect.ALLOW)
                 .principals(List.of(new AnyPrincipal()))
@@ -87,55 +85,70 @@ public class ConductorStack extends Stack {
 
         // --- 4. COMPUTE: Fargate Task with Redis Sidecar ---
         FargateTaskDefinition taskDef = FargateTaskDefinition.Builder.create(this, "ConductorTask")
-                .cpu(1024)        // 1 vCPU
-                .memoryLimitMiB(2048) // 2 GB RAM
+                .cpu(1024)
+                .memoryLimitMiB(2048)
                 .build();
 
-        // Sidecar: Redis (Shared localhost)
+        // REDIS SIDECAR (Supports localhost connection)
         taskDef.addContainer("RedisSidecar", ContainerDefinitionOptions.builder()
                 .image(ContainerImage.fromRegistry("redis:alpine"))
                 .logging(LogDriver.awsLogs(AwsLogDriverProps.builder().streamPrefix("conductor-redis").build()))
                 .portMappings(List.of(PortMapping.builder().containerPort(6379).build()))
                 .build());
 
-        // Main: Netflix Conductor
+        // MAIN CONDUCTOR CONTAINER (Orkes OSS Image)
         Map<String, String> environment = new HashMap<>();
         environment.put("spring.datasource.url", "jdbc:postgresql://" + db.getDbInstanceEndpointAddress() + ":5432/conductor");
         environment.put("spring.datasource.username", "conductor");
         environment.put("conductor.db.type", "postgres");
-        environment.put("conductor.elasticsearch.url", "https://" + search.getDomainEndpoint());
-        environment.put("conductor.elasticsearch.version", "7");
+        
+        // OpenSearch Config
         environment.put("conductor.indexing.enabled", "true");
+        environment.put("conductor.indexing.type", "opensearch"); 
+        environment.put("conductor.elasticsearch.url", "https://" + search.getDomainEndpoint());
+        // Required: Single-node clusters stay 'yellow', Conductor must ignore this to start
+        environment.put("conductor.elasticsearch.clusterHealthColor", "yellow");
+        
+        // Redis Config
         environment.put("conductor.queue.type", "redis_standalone");
-        environment.put("conductor.redis.hosts", "redis://localhost:6379");
-        environment.put("JAVA_OPTS", "-Xmx1536m"); // Leaves room for OS/Redis
+        environment.put("conductor.redis.hosts", "localhost:6379:us-east-1");
+        
+        // JVM Tuning
+        environment.put("JAVA_OPTS", "-Xmx1536m"); 
 
         taskDef.addContainer("ConductorContainer", ContainerDefinitionOptions.builder()
-                .image(ContainerImage.fromRegistry("netflixoss/conductor-server:latest"))
+                .image(ContainerImage.fromRegistry("orkesio/orkes-conductor-server:latest"))
                 .environment(environment)
                 .secrets(Map.of("spring.datasource.password", software.amazon.awscdk.services.ecs.Secret.fromSecretsManager(dbPasswordSecret, "password")))
-                .portMappings(List.of(PortMapping.builder().containerPort(8080).build()))
+                .portMappings(List.of(
+                        PortMapping.builder().containerPort(8080).build(), // API
+                        PortMapping.builder().containerPort(8127).build()  // UI/Visualizer
+                ))
                 .logging(LogDriver.awsLogs(AwsLogDriverProps.builder().streamPrefix("conductor-app").build()))
                 .build());
 
-        // Grant permission to the Task Role to sign requests to OpenSearch
+        // Grant the Task Role permission to interact with OpenSearch
         search.grantReadWrite(taskDef.getTaskRole());
 
-        // --- 5. SERVICE: ALB + Fargate ---
-        ApplicationLoadBalancedFargateService service = ApplicationLoadBalancedFargateService.Builder.create(this, ConductorStack.ecsServiceName)
-                .cluster(Cluster.Builder.create(this, ConductorStack.ecsClusterName).vpc(vpc).build())
+        // --- 5. SERVICE: Load Balanced Fargate ---
+        ApplicationLoadBalancedFargateService service = ApplicationLoadBalancedFargateService.Builder.create(this, "ConductorService")
+                .cluster(Cluster.Builder.create(this, "ConductorCluster").vpc(vpc).build())
                 .taskDefinition(taskDef)
                 .publicLoadBalancer(true)
-                .assignPublicIp(true) // FIX: Allows task to pull secrets from ASM
+                // CRITICAL: Pulls Docker image and Secrets via Internet Gateway
+                .assignPublicIp(true) 
                 .build();
 
-        // --- 6. SECURITY: Open Firewalls ---
+        // Allow ECS to reach RDS
         db.getConnections().allowDefaultPortFrom(service.getService());
 
-        // --- 7. OUTPUTS ---
-        new CfnOutput(this, "ConductorUrl", CfnOutputProps.builder()
-                .value("http://" + service.getLoadBalancer().getLoadBalancerDnsName()).build());
+        // --- 6. OUTPUTS ---
+        new CfnOutput(this, "ConductorAPI", CfnOutputProps.builder()
+                .value("http://" + service.getLoadBalancer().getLoadBalancerDnsName() + ":8080").build());
         
+        new CfnOutput(this, "ConductorUI", CfnOutputProps.builder()
+                .value("http://" + service.getLoadBalancer().getLoadBalancerDnsName() + ":8127").build());
+
         new CfnOutput(this, "OpenSearchDashboard", CfnOutputProps.builder()
                 .value("https://" + search.getDomainEndpoint() + "/_dashboards/").build());
     }
