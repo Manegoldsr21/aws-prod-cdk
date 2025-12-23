@@ -1,0 +1,51 @@
+package com.smanegold.lambda
+
+import software.amazon.awssdk.services.ecs.EcsClient;
+import software.amazon.awssdk.services.ecs.model.UpdateServiceRequest;
+import software.amazon.awssdk.services.rds.RdsClient;
+import software.amazon.awssdk.services.rds.model.StartDbInstanceRequest;
+import software.amazon.awssdk.services.rds.model.StopDbInstanceRequest;
+
+import java.util.Map;
+
+public class EnvironmentScheduler {
+
+    public static void handleRequest(Map<String, Object> event) {
+        String action = (String) event.get("action");
+
+        if ("stop".equals(action)) stop();
+        if ("start".equals(action)) start();
+    }
+
+    private static void stop() {
+        try (EcsClient ecs = EcsClient.create();
+             RdsClient rds = RdsClient.create()) {
+
+            ecs.updateService(UpdateServiceRequest.builder()
+                    .cluster(System.getenv("ECS_CLUSTER"))
+                    .service(System.getenv("ECS_SERVICE"))
+                    .desiredCount(0)
+                    .build());
+
+            rds.stopDBInstance(StopDbInstanceRequest.builder()
+                    .dbInstanceIdentifier(System.getenv("DB_INSTANCE"))
+                    .build());
+        }
+    }
+
+    private static void start() {
+        try (EcsClient ecs = EcsClient.create();
+             RdsClient rds = RdsClient.create()) {
+
+            rds.startDBInstance(StartDbInstanceRequest.builder()
+                    .dbInstanceIdentifier(System.getenv("DB_INSTANCE"))
+                    .build());
+
+            ecs.updateService(UpdateServiceRequest.builder()
+                    .cluster(System.getenv("ECS_CLUSTER"))
+                    .service(System.getenv("ECS_SERVICE"))
+                    .desiredCount(1)
+                    .build());
+        }
+    }
+}

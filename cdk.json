@@ -1,5 +1,5 @@
 {
-  "app": "mvn -e -q compile exec:java",
+  "app": "mvn -q -f cdk/pom.xml exec:java -e",
   "watch": {
     "include": [
       "**"
