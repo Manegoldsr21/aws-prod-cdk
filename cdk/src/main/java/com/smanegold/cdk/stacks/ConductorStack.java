@@ -5,7 +5,7 @@ import software.amazon.awscdk.services.ec2.*;
 import software.amazon.awscdk.services.ec2.InstanceType;
 import software.amazon.awscdk.services.ecs.*;
 import software.amazon.awscdk.services.ecs.patterns.*;
-import software.amazon.awscdk.services.elasticloadbalancingv2.CfnTargetGroup;
+import software.amazon.awscdk.services.elasticloadbalancingv2.*;
 import software.amazon.awscdk.services.iam.*;
 import software.amazon.awscdk.services.logs.*;
 import software.amazon.awscdk.services.opensearchservice.*;
@@ -59,6 +59,7 @@ public class ConductorStack extends Stack {
                 .credentials(Credentials.fromSecret(dbPasswordSecret))
                 .publiclyAccessible(true) 
                 .removalPolicy(RemovalPolicy.DESTROY)
+                .databaseName("conductor") //Initialize the conductor cd for flywheel to run against
                 .build();
 
         // 3. SEARCH: OpenSearch (Single Node)
@@ -120,8 +121,8 @@ public class ConductorStack extends Stack {
                 .environment(environment)
                 .secrets(Map.of("spring.datasource.password", software.amazon.awscdk.services.ecs.Secret.fromSecretsManager(dbPasswordSecret, "password")))
                 .portMappings(List.of(
-                        PortMapping.builder().containerPort(8080).build(), // API
-                        PortMapping.builder().containerPort(8127).build()  // Modern UI
+                        PortMapping.builder().containerPort(8127).name("ui-port").build(),  // Modern UI
+                        PortMapping.builder().containerPort(8080).name("api-port").build() // API
                 ))
                 .logging(LogDriver.awsLogs(AwsLogDriverProps.builder().streamPrefix("conductor-app").build()))
                 .build());
@@ -137,17 +138,34 @@ public class ConductorStack extends Stack {
                 .listenerPort(80) 
                 .build();
 
-        // Direct the default ALB traffic to the UI port (8127)
+        // Route traffic to UI/8127, but we check API/8080 for health
         service.getTargetGroup().configureHealthCheck(software.amazon.awscdk.services.elasticloadbalancingv2.HealthCheck.builder()
                 .path("/health")
                 .port("8080") // Check API health to decide if UI is ready
+                .interval(Duration.seconds(60))
+                .timeout(Duration.seconds(5))
+                .healthyThresholdCount(2)
                 .build());
 
-        // Update target group to point to 8127 (UI)
-        ((CfnTargetGroup) service.getTargetGroup().getNode().getDefaultChild()).setPort(8127);
+        // We add a SECOND listener to the Load Balancer for the API
+        ApplicationListener apiListener = service.getLoadBalancer().addListener("ApiListener", BaseApplicationListenerProps.builder()
+                .port(8080)
+                .protocol(ApplicationProtocol.HTTP)
+                .open(true) // Allow access from anywhere
+                .build());
 
-        // Open API port on the Load Balancer security group
-        service.getLoadBalancer().getConnections().allowFromAnyIpv4(Port.tcp(8080), "Allow API access");
+        // Route this new listener to the Container's API port (8080)
+        apiListener.addTargets("ApiTarget", AddApplicationTargetsProps.builder()
+                .port(8080) // Target Group Port
+                .targets(List.of(service.getService().loadBalancerTarget(LoadBalancerTargetOptions.builder()
+                        .containerName("ConductorContainer")
+                        .containerPort(8080) // Map to the API container port
+                        .build())))
+                .healthCheck(software.amazon.awscdk.services.elasticloadbalancingv2.HealthCheck.builder()
+                        .path("/health")
+                        .port("8080")
+                        .build())
+                .build());
         
         // Allow ECS to reach RDS
         db.getConnections().allowDefaultPortFrom(service.getService());
