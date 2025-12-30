@@ -23,10 +23,11 @@ public class ConductorStack extends Stack {
     public static String ecsClusterName = "ConductorCluster";
     public static String ecsServiceName = "ConductorService";
     public static String rdsInstanceName = "ConductorDb";
+
     public ConductorStack(final Construct scope, final String id, final StackProps props) {
         super(scope, id, props);
 
-        // 1. VPC: Public Subnets (No NAT Gateways to save cost)
+        // 1. VPC
         Vpc vpc = Vpc.Builder.create(this, "ConductorVpc")
                 .maxAzs(2)
                 .natGateways(0)
@@ -39,7 +40,7 @@ public class ConductorStack extends Stack {
                 ))
                 .build();
 
-        // 2. DATABASE: RDS PostgreSQL
+        // 2. DATABASE
         Secret dbPasswordSecret = Secret.Builder.create(this, "ConductorDBPassword")
                 .secretName("conductor-db-password")
                 .generateSecretString(SecretStringGenerator.builder()
@@ -57,13 +58,13 @@ public class ConductorStack extends Stack {
                 .vpc(vpc)
                 .vpcSubnets(SubnetSelection.builder().subnetType(SubnetType.PUBLIC).build())
                 .credentials(Credentials.fromSecret(dbPasswordSecret))
-                .publiclyAccessible(true) 
+                .publiclyAccessible(true)
                 .removalPolicy(RemovalPolicy.DESTROY)
-                .databaseName("conductor") //Initialize the conductor cd for flywheel to run against
+                .databaseName("conductor")
                 .build();
 
-        // 3. SEARCH: OpenSearch (Single Node)
-        String myPublicIp = "65.31.164.160"; 
+        // 3. SEARCH
+        String myPublicIp = "65.31.164.160";
         Domain search = Domain.Builder.create(this, "ConductorSearch")
                 .version(EngineVersion.OPENSEARCH_2_11)
                 .capacity(CapacityConfig.builder()
@@ -74,8 +75,7 @@ public class ConductorStack extends Stack {
                 .ebs(EbsOptions.builder().volumeSize(10).build())
                 .removalPolicy(RemovalPolicy.DESTROY)
                 .build();
-        
-        // Allow your local IP to access the Dashboard
+
         search.addAccessPolicies(PolicyStatement.Builder.create()
                 .effect(Effect.ALLOW)
                 .principals(List.of(new AnyPrincipal()))
@@ -84,92 +84,114 @@ public class ConductorStack extends Stack {
                 .conditions(Map.of("IpAddress", Map.of("aws:SourceIp", List.of(myPublicIp))))
                 .build());
 
-        // 4. COMPUTE: Fargate Task with Redis Sidecar
+
+        // A. Create Service Security Group explicitly
+        SecurityGroup serviceSg = SecurityGroup.Builder.create(this, "ConductorServiceSG")
+                .vpc(vpc)
+                .description("Security Group for Conductor Fargate Service")
+                .allowAllOutbound(true)
+                .build();
+
+        // B. Create Load Balancer Security Group explicitly
+        SecurityGroup lbSg = SecurityGroup.Builder.create(this, "ConductorLBSG")
+                .vpc(vpc)
+                .description("Security Group for Conductor ALB")
+                .allowAllOutbound(true)
+                .build();
+
+        // Allow public access to LB on ports 80 and 8080
+        lbSg.addIngressRule(Peer.anyIpv4(), Port.tcp(80), "Allow HTTP traffic");
+        lbSg.addIngressRule(Peer.anyIpv4(), Port.tcp(8080), "Allow API traffic");
+
+        // C. Manually connect the Service and LB (The Magic Fix)
+        // Allow LB to reach Service on UI port
+        serviceSg.addIngressRule(lbSg, Port.tcp(5000), "Allow UI traffic from ALB");
+        // Allow LB to reach Service on API port
+        serviceSg.addIngressRule(lbSg, Port.tcp(8080), "Allow API traffic from ALB");
+
+        // D. Create the ALB Manually
+        ApplicationLoadBalancer alb = ApplicationLoadBalancer.Builder.create(this, "ConductorALB")
+                .vpc(vpc)
+                .internetFacing(true)
+                .securityGroup(lbSg) // Pass the explicit SG
+                .build();
+
+        // 4. COMPUTE
         FargateTaskDefinition taskDef = FargateTaskDefinition.Builder.create(this, "ConductorTask")
                 .cpu(1024)
                 .memoryLimitMiB(2048)
                 .build();
 
-        // REDIS SIDECAR
         taskDef.addContainer("RedisSidecar", ContainerDefinitionOptions.builder()
                 .image(ContainerImage.fromRegistry("redis:alpine"))
                 .logging(LogDriver.awsLogs(AwsLogDriverProps.builder().streamPrefix("conductor-redis").build()))
                 .portMappings(List.of(PortMapping.builder().containerPort(6379).build()))
                 .build());
 
-        // MAIN CONDUCTOR CONTAINER ENVIRONMENT
         Map<String, String> environment = new HashMap<>();
-
-        // 1. Persistence (PostgreSQL)
         environment.put("conductor.db.type", "redis_standalone");
         environment.put("spring.datasource.url", "jdbc:postgresql://" + db.getDbInstanceEndpointAddress() + ":5432/conductor");
         environment.put("spring.datasource.username", "conductor");
-
-        // 2. Queue & Locking (Redis Sidecar)
         environment.put("conductor.queue.type", "redis_standalone");
         environment.put("conductor.redis.hosts", "localhost:6379:us-east-1");
-        environment.put("conductor.app.workflowExecutionLockEnabled", "true"); // ADD THIS
+        environment.put("conductor.app.workflowExecutionLockEnabled", "true");
         environment.put("conductor.workflow-execution-lock.type", "redis");
         environment.put("conductor.redis-lock.serverAddress", "redis://localhost:6379");
-
-        // 3. Indexing (OpenSearch)
         environment.put("conductor.indexing.enabled", "true");
         environment.put("conductor.indexing.type", "opensearch");
         environment.put("conductor.elasticsearch.url", "https://" + search.getDomainEndpoint());
         environment.put("conductor.elasticsearch.clusterHealthColor", "yellow");
         environment.put("conductor.elasticsearch.indexReplicas", "0");
-
         environment.put("JAVA_OPTS", "-Xmx1536m");
 
-        taskDef.addContainer("ConductorContainer", ContainerDefinitionOptions.builder()
+        ContainerDefinition conductorContainer = taskDef.addContainer("ConductorContainer", ContainerDefinitionOptions.builder()
                 .image(ContainerImage.fromRegistry("orkesio/orkes-conductor-community:latest"))
                 .environment(environment)
                 .secrets(Map.of("spring.datasource.password", software.amazon.awscdk.services.ecs.Secret.fromSecretsManager(dbPasswordSecret, "password")))
                 .portMappings(List.of(
-                        PortMapping.builder().containerPort(1234).name("ui-port").build(),  // Modern UI
-                        PortMapping.builder().containerPort(8080).name("api-port").build() // API
+                        PortMapping.builder().containerPort(5000).name("ui-port").build(),
+                        PortMapping.builder().containerPort(8080).name("api-port").build()
                 ))
                 .logging(LogDriver.awsLogs(AwsLogDriverProps.builder().streamPrefix("conductor-app").build()))
                 .build());
 
+        taskDef.setDefaultContainer(conductorContainer);
+
         search.grantReadWrite(taskDef.getTaskRole());
 
-        // 5. SERVICE: Load Balanced Fargate
+        // 5. SERVICE: Load Balanced Fargate (Updated to use manual resources)
         ApplicationLoadBalancedFargateService service = ApplicationLoadBalancedFargateService.Builder.create(this, "ConductorService")
                 .cluster(Cluster.Builder.create(this, "ConductorCluster").vpc(vpc).build())
                 .taskDefinition(taskDef)
-                .publicLoadBalancer(true)
+                .loadBalancer(alb)
+                .securityGroups(List.of(serviceSg))
                 .assignPublicIp(true)
                 .listenerPort(80)
-                // Force the default target group to use the UI port
                 .targetProtocol(ApplicationProtocol.HTTP)
+                // Disable "openListener" because we manage the LB SG manually above
+                .openListener(false)
                 .build();
 
-        // Add this to ensure the Service waits for the LB to be fully ready
-        service.getService().getNode().addDependency(service.getLoadBalancer());
-
-        // Route traffic to UI/1234, but we check API/8080 for health
         service.getTargetGroup().configureHealthCheck(software.amazon.awscdk.services.elasticloadbalancingv2.HealthCheck.builder()
                 .path("/health")
-                .port("8080") // Check API health to decide if UI is ready
+                .port("8080")
                 .interval(Duration.seconds(60))
                 .timeout(Duration.seconds(5))
                 .healthyThresholdCount(2)
                 .build());
 
-        // We add a SECOND listener to the Load Balancer for the API
+        // 2nd Listener for API
         ApplicationListener apiListener = service.getLoadBalancer().addListener("ApiListener", BaseApplicationListenerProps.builder()
                 .port(8080)
                 .protocol(ApplicationProtocol.HTTP)
-                .open(true) // Allow access from anywhere
+                .open(false) // Set to false because we already allowed 8080 in the LB SG manually
                 .build());
 
-        // Route this new listener to the Container's API port (8080)
         apiListener.addTargets("ApiTarget", AddApplicationTargetsProps.builder()
-                .port(8080) // Target Group Port
+                .port(8080)
                 .targets(List.of(service.getService().loadBalancerTarget(LoadBalancerTargetOptions.builder()
                         .containerName("ConductorContainer")
-                        .containerPort(8080) // Map to the API container port
+                        .containerPort(8080)
                         .build())))
                 .healthCheck(software.amazon.awscdk.services.elasticloadbalancingv2.HealthCheck.builder()
                         .path("/health")
@@ -177,15 +199,14 @@ public class ConductorStack extends Stack {
                         .build())
                 .build());
 
-        // Allow ECS to reach RDS
-        db.getConnections().allowDefaultPortFrom(service.getService());
+        // Fix the DB access using the explicit SG
+        db.getConnections().allowDefaultPortFrom(serviceSg);
 
         // 6. OUTPUTS
         new CfnOutput(this, "ConductorUI", CfnOutputProps.builder()
                 .value("http://" + service.getLoadBalancer().getLoadBalancerDnsName()).build());
-        
+
         new CfnOutput(this, "ConductorAPI", CfnOutputProps.builder()
                 .value("http://" + service.getLoadBalancer().getLoadBalancerDnsName() + ":8080").build());
-
     }
 }
