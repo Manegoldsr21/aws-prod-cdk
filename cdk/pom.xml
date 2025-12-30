@@ -56,5 +56,11 @@
           <version>${junit.version}</version>
           <scope>test</scope>
         </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>ecs</artifactId>
+            <version>2.25.28</version>
+            <scope>compile</scope>
+        </dependency>
     </dependencies>
 </project>

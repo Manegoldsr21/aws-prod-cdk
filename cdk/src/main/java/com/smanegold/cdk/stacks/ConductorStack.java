@@ -97,31 +97,36 @@ public class ConductorStack extends Stack {
                 .portMappings(List.of(PortMapping.builder().containerPort(6379).build()))
                 .build());
 
-        // MAIN CONDUCTOR CONTAINER
+        // MAIN CONDUCTOR CONTAINER ENVIRONMENT
         Map<String, String> environment = new HashMap<>();
+
+        // 1. Persistence (PostgreSQL)
+        environment.put("conductor.db.type", "redis_standalone");
         environment.put("spring.datasource.url", "jdbc:postgresql://" + db.getDbInstanceEndpointAddress() + ":5432/conductor");
         environment.put("spring.datasource.username", "conductor");
-        environment.put("conductor.db.type", "postgres");
-        
-        // OpenSearch Config
-        environment.put("conductor.indexing.enabled", "true");
-        environment.put("conductor.indexing.type", "opensearch"); 
-        environment.put("conductor.elasticsearch.url", "https://" + search.getDomainEndpoint());
-        environment.put("conductor.elasticsearch.clusterHealthColor", "yellow"); // Important for single-node
-        
-        // Redis Config
+
+        // 2. Queue & Locking (Redis Sidecar)
         environment.put("conductor.queue.type", "redis_standalone");
         environment.put("conductor.redis.hosts", "localhost:6379:us-east-1");
-        
-        environment.put("JAVA_OPTS", "-Xmx1536m"); 
+        environment.put("conductor.app.workflowExecutionLockEnabled", "true"); // ADD THIS
+        environment.put("conductor.workflow-execution-lock.type", "redis");
+        environment.put("conductor.redis-lock.serverAddress", "redis://localhost:6379");
+
+        // 3. Indexing (OpenSearch)
+        environment.put("conductor.indexing.enabled", "true");
+        environment.put("conductor.indexing.type", "opensearch");
+        environment.put("conductor.elasticsearch.url", "https://" + search.getDomainEndpoint());
+        environment.put("conductor.elasticsearch.clusterHealthColor", "yellow");
+        environment.put("conductor.elasticsearch.indexReplicas", "0");
+
+        environment.put("JAVA_OPTS", "-Xmx1536m");
 
         taskDef.addContainer("ConductorContainer", ContainerDefinitionOptions.builder()
-                // FIX: Use the 'community' image tag for public access
                 .image(ContainerImage.fromRegistry("orkesio/orkes-conductor-community:latest"))
                 .environment(environment)
                 .secrets(Map.of("spring.datasource.password", software.amazon.awscdk.services.ecs.Secret.fromSecretsManager(dbPasswordSecret, "password")))
                 .portMappings(List.of(
-                        PortMapping.builder().containerPort(8127).name("ui-port").build(),  // Modern UI
+                        PortMapping.builder().containerPort(1234).name("ui-port").build(),  // Modern UI
                         PortMapping.builder().containerPort(8080).name("api-port").build() // API
                 ))
                 .logging(LogDriver.awsLogs(AwsLogDriverProps.builder().streamPrefix("conductor-app").build()))
@@ -134,11 +139,16 @@ public class ConductorStack extends Stack {
                 .cluster(Cluster.Builder.create(this, "ConductorCluster").vpc(vpc).build())
                 .taskDefinition(taskDef)
                 .publicLoadBalancer(true)
-                .assignPublicIp(true) 
-                .listenerPort(80) 
+                .assignPublicIp(true)
+                .listenerPort(80)
+                // Force the default target group to use the UI port
+                .targetProtocol(ApplicationProtocol.HTTP)
                 .build();
 
-        // Route traffic to UI/8127, but we check API/8080 for health
+        // Add this to ensure the Service waits for the LB to be fully ready
+        service.getService().getNode().addDependency(service.getLoadBalancer());
+
+        // Route traffic to UI/1234, but we check API/8080 for health
         service.getTargetGroup().configureHealthCheck(software.amazon.awscdk.services.elasticloadbalancingv2.HealthCheck.builder()
                 .path("/health")
                 .port("8080") // Check API health to decide if UI is ready
@@ -166,7 +176,7 @@ public class ConductorStack extends Stack {
                         .port("8080")
                         .build())
                 .build());
-        
+
         // Allow ECS to reach RDS
         db.getConnections().allowDefaultPortFrom(service.getService());
 
